@@ -24,7 +24,9 @@ log = logging.getLogger("waze_api")
 _API_KEY    = os.environ.get("API_KEY", "")
 _key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-SESSION_TTL = 25  # server kills anonymous sessions at ~30s
+SESSION_TTL    = 25.0  # server kills anonymous sessions at ~30s
+_EMA_ALPHA     = 0.3   # weight for new creation-time samples
+_SAFETY_MARGIN = 2.0   # seconds of buffer on top of EMA
 
 
 def _auth(key: str | None = Security(_key_header)):
@@ -36,22 +38,48 @@ def _auth(key: str | None = Security(_key_header)):
 
 class _Session:
     def __init__(self, sess: WazeSession, lat: float, lon: float):
-        self.sess    = sess
-        self.lat     = lat
-        self.lon     = lon
-        self.born    = time.time()
+        self.sess = sess
+        self.lat  = lat
+        self.lon  = lon
+        self._born = time.monotonic()
 
     def alive(self) -> bool:
-        return time.time() - self.born < SESSION_TTL
+        return self.age < SESSION_TTL
+
+    @property
+    def age(self) -> float:
+        return time.monotonic() - self._born
 
 
-# one slot per region — on-demand, no background thread
-_slots: dict[str, "_Session | None"] = {}
-_locks: dict[str, threading.Lock]    = {}
+class _Slot:
+    """
+    Per-region state machine:
+      current  → live session serving requests
+      warm     → pre-baked next session ready to swap in
+      creating → inline cold-start in progress (other threads wait)
+      baking   → background pre-bake in progress
+      ema      → exponential moving average of creation time (adapts prefetch_age)
+    """
+    def __init__(self):
+        self.cv       = threading.Condition(threading.Lock())
+        self.current  : _Session | None = None
+        self.warm     : _Session | None = None
+        self.creating : bool  = False
+        self.baking   : bool  = False
+        self.lat      : float = 0.0
+        self.lon      : float = 0.0
+        self.ema      : float = 15.0  # initial estimate; adapts on real data
 
-for _r in ("row", "na", "il"):
-    _slots[_r] = None
-    _locks[_r] = threading.Lock()
+    @property
+    def prefetch_age(self) -> float:
+        """Session age at which to start pre-baking the next one."""
+        return max(0.5, SESSION_TTL - self.ema - _SAFETY_MARGIN)
+
+    def _update_ema(self, elapsed: float):
+        self.ema = _EMA_ALPHA * elapsed + (1 - _EMA_ALPHA) * self.ema
+
+
+_slots = {r: _Slot() for r in ("row", "na", "il")}
 
 
 @asynccontextmanager
@@ -70,23 +98,85 @@ def _make_session(lat: float, lon: float) -> _Session:
     return _Session(sess, lat, lon)
 
 
-def _get_session(region: str, lat: float, lon: float) -> _Session:
-    with _locks[region]:
-        s = _slots[region]
-        if s and s.alive():
+def _prebake(slot: _Slot):
+    """Background thread: bake next session using last known coords."""
+    with slot.cv:
+        lat, lon = slot.lat, slot.lon
+
+    t0 = time.monotonic()
+    try:
+        warm = _make_session(lat, lon)
+        elapsed = time.monotonic() - t0
+        with slot.cv:
+            slot.warm = warm
+            slot._update_ema(elapsed)
+            log.debug("pre-bake ready in %.1fs (EMA=%.1fs)", elapsed, slot.ema)
+    except Exception:
+        log.exception("pre-bake failed")
+    finally:
+        with slot.cv:
+            slot.baking = False
+
+
+def _get_session(slot: _Slot, lat: float, lon: float) -> _Session:
+    with slot.cv:
+        slot.lat = lat
+        slot.lon = lon
+
+        # fast path: current session still alive
+        if slot.current and slot.current.alive():
+            s = slot.current
+            # trigger pre-bake if old enough and nothing already warming
+            if s.age >= slot.prefetch_age and not slot.baking and slot.warm is None:
+                slot.baking = True
+                threading.Thread(target=_prebake, args=(slot,), daemon=True).start()
+                log.debug("triggered pre-bake at age=%.1fs prefetch_age=%.1fs", s.age, slot.prefetch_age)
             return s
-        s = _make_session(lat, lon)
-        _slots[region] = s
-        return s
+
+        # warm session ready — zero-downtime swap
+        if slot.warm and slot.warm.alive():
+            slot.current = slot.warm
+            slot.warm    = None
+            slot.baking  = False
+            log.debug("promoted warm session")
+            return slot.current
+
+        # another thread is already creating — wait for it
+        if slot.creating:
+            log.debug("waiting for in-progress cold-start")
+            slot.cv.wait_for(lambda: not slot.creating, timeout=60)
+            if slot.current and slot.current.alive():
+                return slot.current
+            # fall through if timed out or failed
+
+        slot.creating = True
+
+    # cold path: create outside the lock (blocks ~15s)
+    t0 = time.monotonic()
+    try:
+        new_sess = _make_session(lat, lon)
+        elapsed  = time.monotonic() - t0
+    except Exception as exc:
+        with slot.cv:
+            slot.creating = False
+            slot.cv.notify_all()
+        raise RuntimeError(f"Session creation failed: {exc}") from exc
+
+    with slot.cv:
+        slot.current = new_sess
+        slot.warm    = None
+        slot._update_ema(elapsed)
+        slot.creating = False
+        slot.cv.notify_all()
+        log.debug("cold-start done in %.1fs (EMA=%.1fs prefetch_age=%.1fs)",
+                  elapsed, slot.ema, slot.prefetch_age)
+        return new_sess
 
 
-def _return_session(region: str, s: _Session, discard: bool = False):
-    with _locks[region]:
-        if discard or not s.alive():
-            if _slots[region] is s:
-                _slots[region] = None
-        else:
-            _slots[region] = s
+def _return_session(slot: _Slot, s: _Session, discard: bool = False):
+    with slot.cv:
+        if slot.current is s and (discard or not s.alive()):
+            slot.current = None
 
 
 def _run_query(s: _Session, lat: float, lon: float, radius_km: float) -> list:
@@ -116,7 +206,8 @@ def alerts(
 ):
     t0     = time.time()
     region = _region(lat, lon)
-    s      = _get_session(region, lat, lon)
+    slot   = _slots[region]
+    s      = _get_session(slot, lat, lon)
 
     discard = False
     try:
@@ -125,7 +216,7 @@ def alerts(
         discard = True
         raise HTTPException(502, str(exc))
     finally:
-        _return_session(region, s, discard=discard)
+        _return_session(slot, s, discard=discard)
 
     return JSONResponse({
         "query_center":    {"lat": lat, "lon": lon},
@@ -142,6 +233,13 @@ def alerts(
 def health():
     return {
         "status": "ok",
-        "sessions": {r: ("alive" if s and s.alive() else "empty")
-                     for r, s in _slots.items()},
+        "sessions": {
+            r: {
+                "current":      "alive" if (sl := _slots[r]).current and sl.current.alive() else "empty",
+                "warm":         "ready" if sl.warm and sl.warm.alive() else "empty",
+                "ema_s":        round(sl.ema, 1),
+                "prefetch_at_s": round(sl.prefetch_age, 1),
+            }
+            for r in _slots
+        },
     }
