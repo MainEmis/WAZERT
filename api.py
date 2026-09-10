@@ -51,8 +51,8 @@ _REGION_SEED = {
 }
 
 POOL_SIZE_PER_REGION = {"row": 2, "na": 1, "il": 0}
-SESSION_TTL      = 600
-SESSION_MAX_USES = 30
+SESSION_TTL      = 60
+SESSION_MAX_USES = 10
 REFILL_BACKOFF   = [5, 15, 30, 60]
 
 
@@ -193,13 +193,35 @@ def alerts(
     except RuntimeError as exc:
         msg = str(exc)
         if any(k in msg.lower() for k in ("sessionexpired", "relogin", "unknown userid", "secretkey")):
-            log.warning("[%s] session expired mid-query, discarding", region)
+            log.warning("[%s] session expired, retrying with fresh session", region)
             discard = True
-            raise HTTPException(502, f"Session expired: {msg}")
+            pool.release(ps, discard=True)
+            # inline retry with a brand-new session
+            try:
+                ps2 = pool.acquire(timeout=30)
+            except queue.Empty:
+                raise HTTPException(503, "No sessions available after expiry")
+            try:
+                ps2.uses += 1
+                result = _query(ps2, lat, lon, radius_km)
+            except Exception as exc2:
+                pool.release(ps2, discard=True)
+                raise HTTPException(502, str(exc2))
+            pool.release(ps2)
+            return JSONResponse({
+                "query_center":    {"lat": lat, "lon": lon},
+                "query_radius_km": radius_km,
+                "region":          region,
+                "timestamp":       int(time.time()),
+                "latency_ms":      int((time.time() - t0) * 1000),
+                "alert_count":     len(result),
+                "alerts":          result,
+            })
         discard = True
         raise HTTPException(502, msg)
     finally:
-        pool.release(ps, discard=discard)
+        if not discard:
+            pool.release(ps, discard=False)
 
     return JSONResponse({
         "query_center":    {"lat": lat, "lon": lon},
