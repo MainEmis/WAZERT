@@ -24,9 +24,19 @@ log = logging.getLogger("waze_api")
 _API_KEY    = os.environ.get("API_KEY", "")
 _key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-SESSION_TTL    = 25.0  # server kills anonymous sessions at ~30s
-_EMA_ALPHA     = 0.3   # weight for new creation-time samples
-_SAFETY_MARGIN = 2.0   # seconds of buffer on top of EMA
+# ── session lifetime ──────────────────────────────────────────────────────────
+SESSION_TTL    = 25.0   # server kills anonymous sessions ~30s
+_EMA_ALPHA     = 0.3    # smoothing factor for all EMA metrics
+_SAFETY_MARGIN = 2.0    # buffer on top of creation EMA before expiry
+
+# ── traffic / idle ───────────────────────────────────────────────────────────
+_IDLE_MULTIPLIER  = 3.0   # stop pre-baking after (EMA_interval × 3) of silence
+_MIN_IDLE_TIMEOUT = 90.0  # never stop pre-baking if last req was <90s ago
+
+# ── error / backoff ──────────────────────────────────────────────────────────
+_BACKOFF_BASE  = 5.0    # first backoff duration (seconds)
+_BACKOFF_MAX   = 120.0  # cap
+_OK_TO_RESET   = 3      # consecutive successes needed to clear backoff
 
 
 def _auth(key: str | None = Security(_key_header)):
@@ -38,9 +48,9 @@ def _auth(key: str | None = Security(_key_header)):
 
 class _Session:
     def __init__(self, sess: WazeSession, lat: float, lon: float):
-        self.sess = sess
-        self.lat  = lat
-        self.lon  = lon
+        self.sess  = sess
+        self.lat   = lat
+        self.lon   = lon
         self._born = time.monotonic()
 
     def alive(self) -> bool:
@@ -53,30 +63,95 @@ class _Session:
 
 class _Slot:
     """
-    Per-region state machine:
-      current  → live session serving requests
-      warm     → pre-baked next session ready to swap in
-      creating → inline cold-start in progress (other threads wait)
-      baking   → background pre-bake in progress
-      ema      → exponential moving average of creation time (adapts prefetch_age)
+    Per-region adaptive state machine.
+
+    Signals tracked:
+      creation_ema     — how long register→login→handshake actually takes
+      req_interval_ema — EMA of seconds between incoming requests
+      consec_errors    — consecutive failures driving exponential backoff
+      last_req_at      — monotonic timestamp of last request (drives idle gate)
     """
     def __init__(self):
-        self.cv       = threading.Condition(threading.Lock())
-        self.current  : _Session | None = None
-        self.warm     : _Session | None = None
-        self.creating : bool  = False
-        self.baking   : bool  = False
-        self.lat      : float = 0.0
-        self.lon      : float = 0.0
-        self.ema      : float = 15.0  # initial estimate; adapts on real data
+        self.cv              = threading.Condition(threading.Lock())
+
+        # session slots
+        self.current         : _Session | None = None
+        self.warm            : _Session | None = None
+        self.creating        : bool  = False
+        self.baking          : bool  = False
+
+        # last known coords for pre-bake
+        self.lat             : float = 0.0
+        self.lon             : float = 0.0
+
+        # adaptive creation EMA (drives prefetch_age)
+        self.creation_ema    : float = 15.0
+
+        # traffic signal (drives idle_window)
+        self.last_req_at     : float = 0.0
+        self.req_interval_ema: float = 60.0
+
+        # error budget (drives backoff)
+        self.consec_errors   : int   = 0
+        self.consec_ok       : int   = 0
+        self.backoff_until   : float = 0.0
+
+    # ── derived thresholds ────────────────────────────────────────────────────
 
     @property
     def prefetch_age(self) -> float:
-        """Session age at which to start pre-baking the next one."""
-        return max(0.5, SESSION_TTL - self.ema - _SAFETY_MARGIN)
+        """Age at which to start pre-baking the next session."""
+        return max(0.5, SESSION_TTL - self.creation_ema - _SAFETY_MARGIN)
 
-    def _update_ema(self, elapsed: float):
-        self.ema = _EMA_ALPHA * elapsed + (1 - _EMA_ALPHA) * self.ema
+    @property
+    def idle_window(self) -> float:
+        """How long we pre-bake after last request before going idle."""
+        return max(_MIN_IDLE_TIMEOUT, self.req_interval_ema * _IDLE_MULTIPLIER)
+
+    @property
+    def region_active(self) -> bool:
+        """True if traffic was recent enough to warrant pre-baking."""
+        if self.last_req_at == 0.0:
+            return False
+        return time.monotonic() - self.last_req_at < self.idle_window
+
+    @property
+    def in_backoff(self) -> bool:
+        return time.monotonic() < self.backoff_until
+
+    # ── signal recorders ─────────────────────────────────────────────────────
+
+    def record_request(self):
+        """Called on every incoming request. Updates traffic EMA."""
+        now = time.monotonic()
+        if self.last_req_at > 0:
+            interval = now - self.last_req_at
+            self.req_interval_ema = (
+                _EMA_ALPHA * interval + (1 - _EMA_ALPHA) * self.req_interval_ema
+            )
+        self.last_req_at = now
+
+    def record_creation(self, elapsed: float):
+        """Update creation EMA after a successful session creation."""
+        self.creation_ema = _EMA_ALPHA * elapsed + (1 - _EMA_ALPHA) * self.creation_ema
+
+    def record_success(self):
+        """One successful query. Clear error budget after 3 consecutive."""
+        self.consec_ok    += 1
+        self.consec_errors = 0
+        if self.consec_ok >= _OK_TO_RESET:
+            self.backoff_until = 0.0
+
+    def record_error(self):
+        """One failed query. Grow backoff exponentially."""
+        self.consec_ok     = 0
+        self.consec_errors += 1
+        delay = min(_BACKOFF_BASE * (2 ** (self.consec_errors - 1)), _BACKOFF_MAX)
+        self.backoff_until = time.monotonic() + delay
+        log.warning(
+            "region error #%d — backing off %.0fs (idle_window=%.0fs)",
+            self.consec_errors, delay, self.idle_window,
+        )
 
 
 _slots = {r: _Slot() for r in ("row", "na", "il")}
@@ -90,6 +165,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Waze RT API", lifespan=lifespan)
 
 
+# ── session factory ───────────────────────────────────────────────────────────
+
 def _make_session(lat: float, lon: float) -> _Session:
     sess = WazeSession(lat, lon, debug=False)
     sess.register(lat, lon)
@@ -99,18 +176,21 @@ def _make_session(lat: float, lon: float) -> _Session:
 
 
 def _prebake(slot: _Slot):
-    """Background thread: bake next session using last known coords."""
+    """Background thread: create warm session using last known coords."""
     with slot.cv:
         lat, lon = slot.lat, slot.lon
 
     t0 = time.monotonic()
     try:
-        warm = _make_session(lat, lon)
+        warm    = _make_session(lat, lon)
         elapsed = time.monotonic() - t0
         with slot.cv:
             slot.warm = warm
-            slot._update_ema(elapsed)
-            log.debug("pre-bake ready in %.1fs (EMA=%.1fs)", elapsed, slot.ema)
+            slot.record_creation(elapsed)
+            log.debug(
+                "pre-bake ready %.1fs (creation_ema=%.1fs prefetch_age=%.1fs)",
+                elapsed, slot.creation_ema, slot.prefetch_age,
+            )
     except Exception:
         log.exception("pre-bake failed")
     finally:
@@ -120,38 +200,56 @@ def _prebake(slot: _Slot):
 
 def _get_session(slot: _Slot, lat: float, lon: float) -> _Session:
     with slot.cv:
+        slot.record_request()
         slot.lat = lat
         slot.lon = lon
 
-        # fast path: current session still alive
+        # ── backoff gate ─────────────────────────────────────────────────────
+        if slot.in_backoff:
+            remaining = slot.backoff_until - time.monotonic()
+            raise HTTPException(
+                503, f"Region backing off for {remaining:.0f}s after repeated errors"
+            )
+
+        # ── fast path: current session alive ─────────────────────────────────
         if slot.current and slot.current.alive():
             s = slot.current
-            # trigger pre-bake if old enough and nothing already warming
-            if s.age >= slot.prefetch_age and not slot.baking and slot.warm is None:
+            should_bake = (
+                s.age >= slot.prefetch_age
+                and not slot.baking
+                and slot.warm is None
+                and slot.region_active      # idle gate: don't bake for silence
+                and not slot.in_backoff
+            )
+            if should_bake:
                 slot.baking = True
                 threading.Thread(target=_prebake, args=(slot,), daemon=True).start()
-                log.debug("triggered pre-bake at age=%.1fs prefetch_age=%.1fs", s.age, slot.prefetch_age)
+                log.debug(
+                    "pre-bake triggered age=%.1fs prefetch_age=%.1fs "
+                    "idle_window=%.0fs silent=%.0fs",
+                    s.age, slot.prefetch_age,
+                    slot.idle_window, time.monotonic() - slot.last_req_at,
+                )
             return s
 
-        # warm session ready — zero-downtime swap
+        # ── warm slot ready: zero-downtime swap ──────────────────────────────
         if slot.warm and slot.warm.alive():
             slot.current = slot.warm
             slot.warm    = None
             slot.baking  = False
-            log.debug("promoted warm session")
+            log.debug("promoted warm session (age=0s)")
             return slot.current
 
-        # another thread is already creating — wait for it
+        # ── cold path: coalesce concurrent requests ───────────────────────────
         if slot.creating:
-            log.debug("waiting for in-progress cold-start")
+            log.debug("waiting on in-progress cold-start")
             slot.cv.wait_for(lambda: not slot.creating, timeout=60)
             if slot.current and slot.current.alive():
                 return slot.current
-            # fall through if timed out or failed
 
         slot.creating = True
 
-    # cold path: create outside the lock (blocks ~15s)
+    # create outside the lock — blocks ~15s
     t0 = time.monotonic()
     try:
         new_sess = _make_session(lat, lon)
@@ -165,11 +263,13 @@ def _get_session(slot: _Slot, lat: float, lon: float) -> _Session:
     with slot.cv:
         slot.current = new_sess
         slot.warm    = None
-        slot._update_ema(elapsed)
+        slot.record_creation(elapsed)
         slot.creating = False
         slot.cv.notify_all()
-        log.debug("cold-start done in %.1fs (EMA=%.1fs prefetch_age=%.1fs)",
-                  elapsed, slot.ema, slot.prefetch_age)
+        log.debug(
+            "cold-start done %.1fs (creation_ema=%.1fs prefetch_age=%.1fs)",
+            elapsed, slot.creation_ema, slot.prefetch_age,
+        )
         return new_sess
 
 
@@ -179,9 +279,11 @@ def _return_session(slot: _Slot, s: _Session, discard: bool = False):
             slot.current = None
 
 
+# ── query logic ───────────────────────────────────────────────────────────────
+
 def _run_query(s: _Session, lat: float, lon: float, radius_km: float) -> list:
-    if abs(lat - s.lat) * 110574 > 50_000 or \
-       abs(lon - s.lon) * math.cos(math.radians(lat)) * 111320 > 50_000:
+    if (abs(lat - s.lat) * 110574 > 50_000 or
+            abs(lon - s.lon) * math.cos(math.radians(lat)) * 111320 > 50_000):
         s.sess.prepare_for_area(lat, lon)
         s.lat, s.lon = lat, lon
 
@@ -196,6 +298,8 @@ def _run_query(s: _Session, lat: float, lon: float, radius_km: float) -> list:
             cache.pop(rid, None)
     return list(cache.values())
 
+
+# ── endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/alerts")
 def alerts(
@@ -212,8 +316,12 @@ def alerts(
     discard = False
     try:
         result = _run_query(s, lat, lon, radius_km)
+        with slot.cv:
+            slot.record_success()
     except RuntimeError as exc:
         discard = True
+        with slot.cv:
+            slot.record_error()
         raise HTTPException(502, str(exc))
     finally:
         _return_session(slot, s, discard=discard)
@@ -231,15 +339,21 @@ def alerts(
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "sessions": {
-            r: {
-                "current":      "alive" if (sl := _slots[r]).current and sl.current.alive() else "empty",
-                "warm":         "ready" if sl.warm and sl.warm.alive() else "empty",
-                "ema_s":        round(sl.ema, 1),
-                "prefetch_at_s": round(sl.prefetch_age, 1),
+    now = time.monotonic()
+    out = {}
+    for r, sl in _slots.items():
+        with sl.cv:
+            silent = now - sl.last_req_at if sl.last_req_at else None
+            out[r] = {
+                "current":         "alive"   if sl.current and sl.current.alive() else "empty",
+                "warm":            "ready"   if sl.warm    and sl.warm.alive()    else "empty",
+                "state":           "backoff" if sl.in_backoff else ("active" if sl.region_active else "idle"),
+                "creation_ema_s":  round(sl.creation_ema, 1),
+                "prefetch_at_s":   round(sl.prefetch_age, 1),
+                "req_interval_s":  round(sl.req_interval_ema, 1),
+                "idle_window_s":   round(sl.idle_window, 1),
+                "silent_for_s":    round(silent, 1) if silent is not None else None,
+                "consec_errors":   sl.consec_errors,
+                "backoff_left_s":  round(max(0.0, sl.backoff_until - now), 1) if sl.in_backoff else 0,
             }
-            for r in _slots
-        },
-    }
+    return {"status": "ok", "regions": out}
