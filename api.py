@@ -12,12 +12,14 @@ GET /health
 
 import logging
 import math
+import os
 import queue
 import threading
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Security
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 
 from waze_client import (
@@ -30,6 +32,16 @@ from waze_client import (
 )
 
 log = logging.getLogger("waze_api")
+
+_API_KEY = os.environ.get("API_KEY", "")
+_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def _auth(key: str | None = Security(_key_header)):
+    if not _API_KEY:
+        return  # no key configured = open (dev mode)
+    if key != _API_KEY:
+        raise HTTPException(401, "Invalid or missing API key")
 
 # Per-region seed coords used only to create sessions on the right server.
 _REGION_SEED = {
@@ -162,6 +174,7 @@ def alerts(
     lat: float       = Query(21.12,   description="Latitude"),
     lon: float       = Query(-101.68, description="Longitude"),
     radius_km: float = Query(15.0,    ge=1, le=50, description="Radius km"),
+    _: None          = Security(_auth),
 ):
     t0 = time.time()
     region = _region(lat, lon)
