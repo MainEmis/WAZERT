@@ -1,0 +1,13 @@
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
+
+WORKDIR /app
+
+COPY requirements.browser.txt .
+RUN pip install --no-cache-dir -r requirements.browser.txt
+
+# Install Chromium browser binaries
+RUN playwright install chromium
+
+COPY waze_browser.py .
+
+ENTRYPOINT ["python", "-u", "waze_browser.py"]

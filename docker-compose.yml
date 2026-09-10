@@ -1,0 +1,37 @@
+services:
+
+  # Method 2 API — FastAPI wrapper over the RT protocol client
+  waze-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+
+  # Method 1 — Playwright + Chromium, XHR interception of georss
+  waze-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    command:
+      - --lat
+      - "21.12"
+      - --lon
+      - "-101.68"
+      - --radius-km
+      - "15"
+      - --debug
+
+  # Method 2 — Waze mobile RT binary protocol (protobuf)
+  waze-rt:
+    build:
+      context: .
+      dockerfile: Dockerfile.rt
+    command:
+      - --lat
+      - "21.12"
+      - --lon
+      - "-101.68"
+      - --radius-km
+      - "15"
+      - --debug
