@@ -43,7 +43,7 @@ _reg_429_lock    = threading.Lock()
 
 # ── keeper ────────────────────────────────────────────────────────────────────
 _KEEPER_TICK     = 0.5          # seconds between keeper ticks
-_IDLE_DORMANT    = float(os.environ.get("IDLE_DORMANT", "120"))  # keeper goes dormant after N idle seconds
+_IDLE_DORMANT    = float(os.environ.get("IDLE_DORMANT", "3600")) # effectively disabled by default
 
 # ── flood / circuit breaker (API-side) ───────────────────────────────────────
 FLOOD_RPS        = float(os.environ.get("FLOOD_RPS", "10"))
@@ -123,7 +123,7 @@ def _register_session(lat: float, lon: float, region: str) -> "WazeSession":
         sess.register(lat, lon)
     except RuntimeError as exc:
         if "429" in str(exc):
-            _global_429(cooldown=90.0)
+            _global_429(cooldown=30.0)
         raise
     sess.login(lat, lon)
     sess.prepare_for_area(lat, lon)
@@ -167,7 +167,7 @@ class _Slot:
 
         # adaptive creation EMA + per-region jitter (desync region cycles)
         self.creation_ema    : float = 15.0
-        self._jitter         : float = random.uniform(0, 3.0)
+        self._jitter         : float = random.uniform(0, 2.0)
 
         # traffic tracking
         self.req_timestamps  : deque = deque()
@@ -185,8 +185,13 @@ class _Slot:
 
     @property
     def prefetch_age(self) -> float:
-        """Session age at which to pre-bake next, with jitter to desync regions."""
-        return max(0.5, SESSION_TTL - self.creation_ema - _SAFETY_MARGIN) + self._jitter
+        """
+        Session age at which to pre-bake next.
+        Uses creation_ema * 1.3 as conservative p95 estimate to absorb network jitter.
+        Jitter (0-2s) desynchronizes region cycles so they never register simultaneously.
+        """
+        conservative = self.creation_ema * 1.3 + _SAFETY_MARGIN
+        return max(3.0, SESSION_TTL - conservative) + self._jitter
 
     @property
     def in_backoff(self) -> bool:
@@ -388,7 +393,7 @@ def _get_session(slot: _Slot, lat: float, lon: float) -> _Session:
                     or slot.circuit_open
                     or slot.in_backoff
                 ),
-                timeout=35,
+                timeout=40,   # outlasts one full creation + 429 cooldown cycle
             )
             if slot.circuit_open:
                 raise HTTPException(429, f"[{slot.region}] Flood mid-wait")
@@ -396,7 +401,7 @@ def _get_session(slot: _Slot, lat: float, lon: float) -> _Session:
                 raise HTTPException(503, f"[{slot.region}] Waze error mid-wait")
             if slot.current and slot.current.alive():
                 return slot.current
-            raise HTTPException(503, f"[{slot.region}] No session after 35s")
+            raise HTTPException(503, f"[{slot.region}] No session after 40s")
 
         # first ever request: cold-start inline, then hand to keeper
         slot.baking = True
