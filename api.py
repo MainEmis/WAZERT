@@ -38,7 +38,7 @@ _REGION_SEED = {
     "il":  (31.77,   35.21),    # Jerusalem → rt-xlb-il.waze.com
 }
 
-POOL_SIZE_PER_REGION = {"row": 3, "na": 2, "il": 1}
+POOL_SIZE_PER_REGION = {"row": 2, "na": 1, "il": 0}
 SESSION_TTL      = 600
 SESSION_MAX_USES = 30
 REFILL_BACKOFF   = [5, 15, 30, 60]
